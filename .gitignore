@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+runtime/
+.env
+crypto_bot.egg-info/
+tmp/
+*.db

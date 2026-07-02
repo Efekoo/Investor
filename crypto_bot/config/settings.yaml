@@ -1,0 +1,188 @@
+app:
+  mode: paper            # paper | live | backtest
+  exchange: binance
+  timezone: UTC
+  log_level: INFO
+  data_dir: runtime
+  initial_paper_balance: 10000
+  log_json: false
+  log_dir: /tmp/crypto_bot_logs
+
+trading:
+  symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "AVAX/USDT", "DOGE/USDT", "ADA/USDT"]
+  timeframe: "1m"
+  higher_timeframe: "1h"
+  scheduler_interval_seconds: 30   # 60→30: Paralel fetch sayesinde daha hızlı döngü
+  quote_currency: "USDT"
+  max_open_trades: 5               # 3→5: 8 sembol için daha fazla fırsat
+  cooldown_seconds: 120
+  allow_short: true                # Açığa satış (futures) — düşüş trendlerinde de fırsat
+  min_consensus_votes: 0           # 0 = basit çoğunluk (n//2+1); >0 ise sabit eşik (gevşetmek için 1-2 deneyin)
+  enable_strategies: ["ema_rsi_volume", "bollinger_mean_reversion", "volatility_breakout", "grid", "vwap_reversion", "supertrend"]
+
+
+strategy:
+  name: ema_rsi_volume
+  params:
+    bollinger_mean_reversion:
+      primary_timeframe: "1m"
+      confirm_timeframe: "1h"
+      period: 14
+      std_dev: 1.0
+    ema:
+      fast_period: 12
+      slow_period: 26
+      primary_timeframe: "1m"
+      confirm_timeframe: "1h"
+    rsi:
+      period: 14
+      oversold: 30
+      overbought: 70
+      primary_timeframe: "1m"
+      confirm_timeframe: "1h"
+    ema_rsi_volume:
+      primary_timeframe: "1m"
+      confirm_timeframe: "5m"
+      ema_fast: 12
+      ema_slow: 26
+      rsi_period: 14
+      stoch_period: 14       # StochRSI periyodu
+      smooth_k: 3            # %K yumuşatma
+      smooth_d: 3            # %D yumuşatma
+      stoch_lower: 25        # Aşırı satım eşiği (eski rsi_lower: 35 yerine)
+      stoch_upper: 75        # Aşırı alım eşiği (eski rsi_upper: 70 yerine)
+      volume_window: 20
+      min_volume_ratio: 1.0
+    bollinger:
+      bb_period: 20
+      bb_std: 2.0
+      rsi_period: 14
+      rsi_oversold: 35
+      rsi_overbought: 65
+      max_band_width: 0.04
+      touch_pct: 0.001
+    volatility_breakout:
+      primary_timeframe: "1m"
+      confirm_timeframe: "1h"
+      lookback: 20
+    grid:
+      primary_timeframe: "1m"
+      lookback: 50           # Son 50 mumda aralık hesapla
+      grid_levels: 5         # Aralığı 5 seviyeye böl
+      proximity_pct: 0.003   # Grid seviyesine %0.3 yaklaşınca sinyal üret
+      max_range_pct: 0.05    # Aralık %5'ten geniş olursa RANGE değil → HOLD
+      min_range_pct: 0.005   # Aralık %0.5'ten dar olursa spread riski → HOLD
+    vwap_reversion:
+      primary_timeframe: "1m"
+      confirm_timeframe: "1h"
+      vwap_period: 240       # 240 mum = 4 saat (1m TF için)
+      buy_band_mult: 1.0     # VWAP - 1*std altında BUY
+      sell_band_mult: 1.0    # VWAP + 1*std üstünde SELL
+    supertrend:
+      primary_timeframe: "1m"
+      confirm_timeframe: "1h"
+      atr_period: 10         # Standart Supertrend ATR periyodu
+      multiplier: 3.0        # ATR çarpanı (daha büyük = daha az sinyal, daha güvenilir)
+
+market_intelligence:
+  atr_period: 14
+  adx_period: 14
+  trend_adx_threshold: 25
+  high_volatility_threshold: 0.02
+  low_volatility_threshold: 0.005
+  min_volume_threshold: 10
+  max_spread_pct: 0.003
+  min_volatility_filter: 0.0002
+  max_volatility_filter: 0.05
+  no_trade_adx_threshold: 18
+  min_trend_strength_adx: 20
+  min_confirmation_score: 0.4
+  ob_imbalance_min: -0.3
+  min_net_edge_margin: 1.5         # İlk TP, gidiş-dönüş maliyetinin en az 1.5 katı olmalı
+
+performance:
+  min_trades_for_eval: 10
+  min_win_rate: 0.40
+  max_drawdown: 0.20
+  min_pnl: -20
+  drawdown_risk_multiplier: 0.7
+  high_volatility_risk_multiplier: 0.65
+  stable_profit_risk_multiplier: 1.05
+
+risk:
+  risk_per_trade: 0.01
+  stop_loss_pct: 0.01
+  take_profit_pct: 0.02
+  trailing_stop_pct: 0.008
+  break_even_trigger_pct: 0.01
+  max_daily_loss_pct: 0.05
+  max_weekly_loss_pct: 0.15
+  max_risk_per_symbol_pct: 0.25
+  volatility_position_scale: 10.0
+  max_trade_size_quote: 2000        # 2500→2000: max_open_trades arttı, exposure dengele
+  max_slippage_pct: 0.001
+  max_consecutive_losses: 3
+  volatility_spike_threshold: 0.03
+  slippage_breaker_threshold: 0.01
+  use_kelly: true
+  kelly_fraction: 0.5
+
+execution:
+  order_type: market
+  use_post_only_entry: true
+  limit_entry_offset_pct: 0.0002
+  limit_entry_timeout_seconds: 15
+  max_retries: 3
+  retry_delay_seconds: 2
+  poll_interval_seconds: 3
+  use_websocket: true
+  ws_reconnect_delay_seconds: 3
+  websocket_only: false
+  use_order_book: true
+  order_book_depth: 50
+  slippage_model: dynamic
+  slippage_volatility_factor: 6.0
+  slippage_volume_factor: 300.0
+  simulate_order_delay_seconds: 0.25
+  partial_fill_min_ratio: 0.6
+  fee_pct: 0.001
+  backtest_execution_delay_candles: 1
+  order_fill_timeout_seconds: 20
+  max_execution_drift_pct: 0.003
+  max_exchange_failures_before_pause: 5
+  timeout_spike_ms: 8000
+  use_private_ws: false
+
+database:
+  url: postgresql://postgres:postgres@localhost:5432/investor_db
+
+sentiment:
+  enabled: true   # Fear & Greed Index
+
+funding_rate:
+  enabled: true                        # Binance USDT-M perpetual sinyalleri
+  cache_ttl_seconds: 300               # 5 dakika önbellekleme
+  extreme_positive_threshold: 0.001   # %0.1 → aşırı uzun, BUY filtrele
+  extreme_negative_threshold: -0.001  # %-0.1 → aşırı kısa, SELL filtrele
+  moderate_positive_threshold: 0.0003 # %0.03 → orta düzey, riski azalt
+  moderate_negative_threshold: -0.0003
+
+notifications:
+  telegram_enabled: false
+  command_poll_interval_seconds: 5
+
+safety:
+  require_live_confirmation: true
+  live_confirmation_env: LIVE_TRADING_CONFIRM
+  live_confirmation_value: "YES"
+  live_runtime_confirmation_env: LIVE_RUNTIME_CONFIRM
+  live_runtime_confirmation_value: "CONFIRMED"
+  dry_run_on_live_start: true
+  global_kill_switch: false
+  kill_switch_file: runtime/KILL_SWITCH
+
+runtime:
+  config_reload_seconds: 15
+  state_file: /tmp/state.json
+  max_stale_data_seconds: 180
+  max_clock_drift_ms: 5000

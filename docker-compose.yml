@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgres:16
+    container_name: crypto_db
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      POSTGRES_DB: ${DB_NAME:-investor_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin_bot
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@bot.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+
+  bot:
+    build: .
+    container_name: crypto_bot_instance
+    restart: unless-stopped
+    volumes:
+      - .:/app:Z
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-investor_db}
+    depends_on:
+      - db
+
+  dashboard:
+    build: .
+    container_name: crypto_dashboard
+    volumes:
+      - .:/app:Z
+    command: streamlit run crypto_bot/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8502:8501"
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-investor_db}
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
