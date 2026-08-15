@@ -14,12 +14,13 @@ crypto_bot/
 ├── strategies/      # 8 pluggable strategies on a common base class:
 │                    # EMA, RSI, EMA+RSI+Volume, Bollinger mean-reversion,
 │                    # breakout, grid, SuperTrend, VWAP
-├── backtest/        # Backtest engine with fee / slippage / delay simulation
-│                    # + Optuna-based parameter optimization
+├── backtest/        # Backtest engine with fee / slippage / delay simulation,
+│                    # intra-candle SL/TP, risk-based sizing, historical data
+│                    # loader + Optuna optimization & walk-forward analysis
 ├── database/        # SQLite persistence: orders, trades, balances, logs,
 │                    # crash-state recovery
 ├── config/          # YAML settings (mode, symbols, timeframes, risk limits)
-└── tests/           # 19 pytest tests
+└── tests/           # 28 pytest tests
 ```
 
 **Key design points**
@@ -54,13 +55,30 @@ Or with Docker:
 docker compose up --build
 ```
 
+## Strategy validation (do this before going live)
+
+Run every strategy against real historical data and compare with buy & hold — after realistic fees, slippage, and stop-losses:
+
+```bash
+# Download 1 year of Binance 1h data (cached in runtime/data/) and compare all strategies
+python -m crypto_bot.backtest.run --symbols BTC/USDT,ETH/USDT,SOL/USDT --timeframe 1h --days 365
+
+# Offline smoke test without network
+python -m crypto_bot.backtest.run --synthetic
+
+# Walk-forward analysis: optimize on train folds, verify on unseen test folds
+python -m crypto_bot.backtest.run --symbols BTC/USDT --timeframe 1h --days 365 --walk-forward supertrend
+```
+
+The report (CSV + HTML in `runtime/reports/`) labels each strategy x symbol pair `PROMISING`, `PROFITABLE_BUT_LAGS_BH`, or `NOT_VIABLE` based on return vs. buy & hold, profit factor, and max drawdown. Only promote strategies to paper/live that stay `PROMISING` out-of-sample.
+
 ## Tests
 
 ```bash
 pytest crypto_bot/tests
 ```
 
-19 tests covering strategies, risk rules, backtest accounting, and the optimizer — run on every push via GitHub Actions.
+28 tests covering strategies, risk rules, backtest accounting, stop-loss/sizing simulation, multi-timeframe lookahead safety, and the optimizer — run on every push via GitHub Actions.
 
 ## Disclaimer
 

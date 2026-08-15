@@ -33,6 +33,7 @@ from crypto_bot.strategies.rsi_strategy import RSIStrategy
 from crypto_bot.strategies.supertrend_strategy import SupertrendStrategy
 from crypto_bot.strategies.vwap_strategy import VWAPReversionStrategy
 from crypto_bot.strategies.base_strategy import Strategy, StrategyDecision
+from crypto_bot.backtest.filters import bear_regime_filter, bull_regime_filter
 from crypto_bot.core.funding_rate import FundingRateAnalyzer
 from crypto_bot.utils.logger import get_logger, log_event
 from crypto_bot.utils.notifier import TelegramNotifier
@@ -929,10 +930,46 @@ class TradingBot:
             return
         if not self._can_trade_symbol(symbol):
             return
+        filter_ok, filter_reason = self._direction_filter_ok(entry_side, frames, timeframe)
+        if not filter_ok:
+            log_event(
+                self.logger, "INFO", "entry_blocked_by_regime_filter",
+                "Regime direction filter blocked entry",
+                symbol=symbol, side=entry_side, reason=filter_reason,
+            )
+            return
         self._open_trade(
             symbol, entry_side, last_price, candle_ts, context,
             regime_state, decision, voters, current_equity, trade_id, signal_ts,
         )
+
+    def _direction_filter_ok(self, entry_side: str, frames: dict, primary_tf: str) -> tuple[bool, str]:
+        """Rejim yön filtresi (backtest'te doğrulandı: ayı yılında kayıpları ciddi keser).
+
+        BUY  → sadece boğa rejiminde (fiyat > EMA200, EMA50 > EMA200, EMA200 yükseliyor)
+        SELL → sadece ayı rejiminde (ayna koşullar)
+
+        Filtre higher_timeframe verisi üzerinde hesaplanır; kapalı olmayan son mumun
+        etkisini azaltmak için bir önceki mumun değeri kullanılır.
+        """
+        if not bool(self.settings["trading"].get("regime_entry_filter", False)):
+            return True, "filter_disabled"
+
+        higher_tf = self.settings["trading"].get("higher_timeframe", primary_tf)
+        df = frames.get(higher_tf)
+        if df is None or df.empty:
+            df = frames.get(primary_tf)
+        if df is None or len(df) < 210:
+            return True, "insufficient_data_for_filter"  # fail-open: veri yoksa engelleme
+
+        if entry_side == "buy":
+            allowed = bull_regime_filter(df)
+        else:
+            allowed = bear_regime_filter(df)
+        # Son mum kapanmamış olabilir → bir önceki (kapalı) muma bak
+        idx = -2 if len(allowed) >= 2 else -1
+        ok = bool(allowed.iloc[idx])
+        return ok, "ok" if ok else f"regime_not_{'bull' if entry_side == 'buy' else 'bear'}"
 
     def _close_open_position(
         self, symbol: str, close_side: str, last_price: float,

@@ -9,7 +9,9 @@ app:
   log_dir: /tmp/crypto_bot_logs
 
 trading:
-  symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "AVAX/USDT", "DOGE/USDT", "ADA/USDT"]
+  # 730 günlük filtreli backtest'e göre budandı (rapor: runtime/reports/backtest_report_20260720_160815):
+  # ema+filtre kârlı: BTC +29%, ETH +40%, DOGE +15%, BNB +15% | elendi: SOL -36, XRP -22, AVAX -12, ADA ~0
+  symbols: ["BTC/USDT", "ETH/USDT", "BNB/USDT", "DOGE/USDT"]
   timeframe: "1m"
   higher_timeframe: "1h"
   scheduler_interval_seconds: 30   # 60→30: Paralel fetch sayesinde daha hızlı döngü
@@ -18,7 +20,11 @@ trading:
   cooldown_seconds: 120
   allow_short: true                # Açığa satış (futures) — düşüş trendlerinde de fırsat
   min_consensus_votes: 0           # 0 = basit çoğunluk (n//2+1); >0 ise sabit eşik (gevşetmek için 1-2 deneyin)
-  enable_strategies: ["ema_rsi_volume", "bollinger_mean_reversion", "volatility_breakout", "grid", "vwap_reversion", "supertrend"]
+  regime_entry_filter: true        # Yön filtresi: BUY sadece boğa rejiminde, SELL sadece ayı rejiminde
+                                   # (1 yıllık backtest: 14/24 çiftte iyileşme, drawdown'lar yarılandı)
+  # grid ve volatility_breakout çıkarıldı: 365 günlük backtest'te tüm sembollerde
+  # en kötü performans (grid/BTC -%47). Rapor: runtime/reports/
+  enable_strategies: ["ema_rsi_volume", "bollinger_mean_reversion", "vwap_reversion", "supertrend", "ema"]
 
 
 strategy:
@@ -154,7 +160,9 @@ execution:
   use_private_ws: false
 
 database:
-  url: postgresql://postgres:postgres@localhost:5432/investor_db
+  # Yerel/paper mod: SQLite (kurulum gerektirmez). Docker/production'da
+  # DATABASE_URL ortam değişkeni bunu ezer (örn. postgresql://...).
+  url: sqlite:///runtime/investor.db
 
 sentiment:
   enabled: true   # Fear & Greed Index

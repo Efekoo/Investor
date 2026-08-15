@@ -148,7 +148,9 @@ class StrategyOptimizer:
                 "train_metric": train_result["best_metric"],
                 "test_metric": test_result.metrics.get(self.metric, 0.0),
                 "test_trades": test_result.metrics["total_trades"],
-                "test_drawdown": test_result.metrics.get("max_drawdown", 0.0)
+                "test_drawdown": test_result.metrics.get("max_drawdown", 0.0),
+                "test_return": test_result.metrics.get("total_return_pct", 0.0),
+                "test_buy_hold": test_result.metrics.get("buy_hold_return_pct", 0.0),
             })
 
         return wf_results
