@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from crypto_bot.core.leverage import clamp_stop_to_liquidation, liquidation_price
+
 from crypto_bot.backtest.metrics import max_drawdown, profit_factor, sharpe_ratio, win_rate
 
 _TF_MINUTES = {"m": 1, "h": 60, "d": 1440, "w": 10080}
@@ -37,6 +39,9 @@ class BacktestEngine:
         sliced without lookahead (only fully closed HTF candles are visible)
       - optional entry filter (e.g. bull-regime): blocks new longs on candles
         where the filter is False; exits keep working so positions can close
+      - optional leverage (isolated margin): only margin is locked, SL is pulled
+        inside the liquidation price, and a candle whose low crosses the
+        liquidation price wipes out the whole margin
     """
 
     def __init__(
@@ -54,6 +59,9 @@ class BacktestEngine:
         timeframe: str | None = None,
         max_window: int = 500,
         warmup: int = 60,
+        leverage: float = 1.0,
+        maintenance_margin_rate: float = 0.005,
+        liquidation_buffer: float = 0.5,
     ):
         self.strategy = strategy
         self.initial_balance = initial_balance
@@ -68,6 +76,9 @@ class BacktestEngine:
         self.timeframe = timeframe
         self.max_window = max_window
         self.warmup = warmup
+        self.leverage = max(1.0, leverage)
+        self.maintenance_margin_rate = maintenance_margin_rate
+        self.liquidation_buffer = liquidation_buffer
 
     def _context(self, data: pd.DataFrame, idx: int) -> tuple[float, float]:
         start = max(0, idx - 30)
@@ -84,7 +95,8 @@ class BacktestEngine:
         """Risk-based sizing when configured; otherwise all-in (legacy)."""
         if buy_price <= 0:
             return 0.0
-        max_affordable = cash / (buy_price * (1 + self.taker_fee_pct))
+        # Kaldıraçta yalnızca teminat (notional / lev) + fee nakitten düşer
+        max_affordable = cash / (buy_price * (1 / self.leverage + self.taker_fee_pct))
         if self.risk_per_trade is None or stop_price is None or stop_price >= buy_price:
             return max_affordable
         per_unit_risk = buy_price - stop_price
@@ -104,6 +116,9 @@ class BacktestEngine:
         qty = 0.0
         entry_price = 0.0
         entry_fee = 0.0
+        margin = 0.0
+        liq_price = 0.0
+        liquidations = 0
         stop_price: float | None = None
         take_price: float | None = None
         trades: list[dict] = []
@@ -120,12 +135,22 @@ class BacktestEngine:
         n = len(data)
         timestamps = data["timestamp"]
 
+        leveraged = self.leverage > 1.0
+
         def close_position(i: int, exit_price: float, reason: str) -> None:
-            nonlocal cash, qty, entry_price, entry_fee, stop_price, take_price, fees_paid
+            nonlocal cash, qty, entry_price, entry_fee, stop_price, take_price, fees_paid, margin, liq_price
             gross = qty * exit_price
-            exit_fee = gross * self.taker_fee_pct
-            pnl = (exit_price - entry_price) * qty - entry_fee - exit_fee
-            cash += gross - exit_fee
+            if reason == "liquidation":
+                # Isolated margin: teminatın tamamı kaybedilir, nakde bir şey dönmez
+                exit_fee = 0.0
+                pnl = -(margin + entry_fee)
+            else:
+                exit_fee = gross * self.taker_fee_pct
+                pnl = (exit_price - entry_price) * qty - entry_fee - exit_fee
+                if leveraged:
+                    cash += margin + (exit_price - entry_price) * qty - exit_fee
+                else:
+                    cash += gross - exit_fee
             fees_paid += exit_fee
             trades.append(
                 {
@@ -141,6 +166,8 @@ class BacktestEngine:
             qty = 0.0
             entry_price = 0.0
             entry_fee = 0.0
+            margin = 0.0
+            liq_price = 0.0
             stop_price = None
             take_price = None
 
@@ -156,7 +183,10 @@ class BacktestEngine:
                 if self.trailing_stop_pct is not None:
                     candidate = high * (1 - self.trailing_stop_pct)
                     stop_price = max(stop_price or 0.0, candidate) if stop_price else candidate
-                if stop_price is not None and low <= stop_price:
+                if liq_price > 0 and low <= liq_price:
+                    liquidations += 1
+                    close_position(i, liq_price, "liquidation")
+                elif stop_price is not None and low <= stop_price:
                     close_position(i, stop_price, "stop_loss")
                 elif take_price is not None and high >= take_price:
                     close_position(i, take_price, "take_profit")
@@ -185,12 +215,20 @@ class BacktestEngine:
                 if action == "BUY" and qty == 0.0 and entry_allowed:
                     buy_price = close * (1 + slip)
                     sl = buy_price * (1 - self.stop_loss_pct) if self.stop_loss_pct else None
+                    if leveraged and sl is not None:
+                        sl = clamp_stop_to_liquidation(
+                            "BUY", buy_price, sl, self.leverage,
+                            self.maintenance_margin_rate, self.liquidation_buffer,
+                        )
                     tp = buy_price * (1 + self.take_profit_pct) if self.take_profit_pct else None
                     new_qty = self._position_qty(cash, buy_price, sl)
                     notional = new_qty * buy_price
                     fee = notional * self.taker_fee_pct
-                    if new_qty > 0 and notional + fee <= cash + 1e-9:
-                        cash -= notional + fee
+                    locked = notional / self.leverage
+                    if new_qty > 0 and locked + fee <= cash + 1e-9:
+                        cash -= locked + fee
+                        margin = locked if leveraged else 0.0
+                        liq_price = liquidation_price("BUY", buy_price, self.leverage, self.maintenance_margin_rate)
                         qty = new_qty
                         entry_price = buy_price
                         entry_fee = fee
@@ -210,7 +248,10 @@ class BacktestEngine:
                 elif action == "SELL" and qty > 0.0:
                     close_position(i, close * (1 - slip), "signal")
 
-            mark_equity = cash + qty * close
+            if leveraged:
+                mark_equity = cash + margin + (close - entry_price) * qty if qty > 0 else cash
+            else:
+                mark_equity = cash + qty * close
             equity.append({"timestamp": row["timestamp"], "equity": mark_equity})
 
         trades_df = pd.DataFrame(trades)
@@ -240,5 +281,7 @@ class BacktestEngine:
             "fees_paid": fees_paid,
             "avg_trade_pnl": float(sell_trades["pnl"].mean()) if not sell_trades.empty else 0.0,
             "exposure_pct": candles_in_market / candles_total,
+            "leverage": self.leverage,
+            "liquidations": liquidations,
         }
         return BacktestResult(trades=sell_trades, equity_curve=equity_df, metrics=metrics)

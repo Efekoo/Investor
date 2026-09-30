@@ -19,6 +19,13 @@ from crypto_bot.core.performance import PerformanceConfig, StrategyPerformanceTr
 from crypto_bot.core.regime import RegimeDetector
 from crypto_bot.core.exchange import ExchangeClient, ExchangeConfig
 from crypto_bot.core.execution import ExecutionConfig, ExecutionEngine
+from crypto_bot.core.leverage import (
+    LeverageConfig,
+    clamp_stop_to_liquidation,
+    is_liquidated,
+    liquidation_price,
+    spot_symbol,
+)
 from crypto_bot.core.portfolio import Portfolio, Position
 from crypto_bot.core.risk import RiskConfig, RiskManager
 from crypto_bot.core.sentiment import SentimentAnalyzer
@@ -125,6 +132,7 @@ class TradingBot:
             chat_id=os.getenv("TELEGRAM_CHAT_ID"),
         )
 
+        self.leverage = LeverageConfig.from_settings(settings)
         exchange_cfg = ExchangeConfig(
             name=settings["app"]["exchange"],
             api_key=os.getenv("EXCHANGE_API_KEY", ""),
@@ -133,6 +141,8 @@ class TradingBot:
             mode=self.mode,
             max_retries=settings["execution"]["max_retries"],
             retry_delay_seconds=settings["execution"]["retry_delay_seconds"],
+            market_type=self.leverage.market_type if self.leverage.enabled else "spot",
+            settle_currency=self.leverage.settle_currency,
         )
         self.exchange = ExchangeClient(exchange_cfg, self.logger)
         self.exchange.load_markets()
@@ -160,7 +170,14 @@ class TradingBot:
         self._recover_open_trades_from_db()
         self._require_live_double_confirmation()
         if self.mode == "live":
+            if self.leverage.enabled:
+                self.exchange.configure_leverage(
+                    settings["trading"]["symbols"], self.leverage.leverage, self.leverage.margin_mode
+                )
             self._sync_positions_with_exchange()
+        if self.leverage.enabled:
+            log_event(self.logger, "WARNING", "leverage_active", "Leveraged futures trading enabled",
+                      leverage=self.leverage.leverage, margin_mode=self.leverage.margin_mode, mode=self.mode)
 
     def _build_risk_manager(self, settings: dict[str, Any]) -> RiskManager:
         cfg = settings["risk"]
@@ -236,6 +253,7 @@ class TradingBot:
                 use_post_only_entry=bool(cfg.get("use_post_only_entry", False)),
                 limit_entry_offset_pct=float(cfg.get("limit_entry_offset_pct", 0.0002)),
                 limit_entry_timeout_seconds=float(cfg.get("limit_entry_timeout_seconds", 15.0)),
+                futures=self.leverage.enabled,
             ),
         )
 
@@ -303,27 +321,33 @@ class TradingBot:
         if self.portfolio.open_count() > 0:
             return
         with self.db.session_scope() as session:
+            lev = self.leverage.effective_leverage
             for row in session.query(Trade).filter(Trade.status == "open").all():
-                stop, take = self.risk.get_stop_take_prices(str(row.side or "BUY"), float(row.entry_price))
+                side = str(row.side or "BUY")
+                entry = float(row.entry_price)
+                stop, take = self.risk.get_stop_take_prices(side, entry)
                 self.portfolio.open_position(
                     Position(
                         symbol=row.symbol,
                         side=row.side,
-                        entry_price=float(row.entry_price),
+                        entry_price=entry,
                         qty=float(row.qty),
                         entry_fee=max(0.0, -float(row.pnl or 0.0)),
                         stop_loss=stop,
                         take_profit=take,
-                        peak_price=float(row.entry_price),
+                        peak_price=entry,
                         strategy_name="recovered",
                         opened_at=row.opened_at,
+                        leverage=lev,
+                        margin=float(row.qty) * entry / lev if self.leverage.enabled else 0.0,
+                        liquidation_price=liquidation_price(side, entry, lev, self.leverage.maintenance_margin_rate),
                     )
                 )
 
     def _sync_positions_with_exchange(self) -> None:
         positions = self.exchange.fetch_positions(self.settings["trading"]["symbols"])
-        for symbol, qty in positions.items():
-            if qty <= 0:
+        for symbol, signed_qty in positions.items():
+            if signed_qty == 0:
                 continue
             if self.portfolio.is_open(symbol):
                 continue
@@ -331,11 +355,13 @@ class TradingBot:
             entry = float(ticker.get("last") or ticker.get("close") or 0.0)
             if entry <= 0:
                 continue
-            stop, take = self.risk.get_stop_take_prices("BUY", entry)
+            side = "SELL" if signed_qty < 0 else "BUY"
+            qty = abs(signed_qty)
+            stop, take = self.risk.get_stop_take_prices(side, entry)
             self.portfolio.open_position(
                 Position(
                     symbol=symbol,
-                    side="BUY",
+                    side=side,
                     entry_price=entry,
                     qty=qty,
                     entry_fee=0.0,
@@ -345,7 +371,7 @@ class TradingBot:
                     strategy_name="synced",
                 )
             )
-            log_event(self.logger, "WARNING", "position_sync", "External position synced", symbol=symbol, qty=qty)
+            log_event(self.logger, "WARNING", "position_sync", "External position synced", symbol=symbol, side=side, qty=qty)
 
     def _refresh_exchange_open_orders(self) -> None:
         snapshot: dict[str, dict[str, Any]] = {}
@@ -365,7 +391,8 @@ class TradingBot:
         self._refresh_exchange_open_orders()
         ext_positions = self.exchange.fetch_positions(self.settings["trading"]["symbols"])
         for symbol in self.settings["trading"]["symbols"]:
-            ext_qty = float(ext_positions.get(symbol, 0.0))
+            signed_qty = float(ext_positions.get(symbol, 0.0))
+            ext_qty = abs(signed_qty)
             int_pos = self.portfolio.positions.get(symbol)
             if int_pos and ext_qty == 0 and not self._has_open_order_for_symbol(symbol):
                 log_event(self.logger, "WARNING", "desync_fix", "Removing ghost internal position", symbol=symbol)
@@ -373,11 +400,12 @@ class TradingBot:
             elif (not int_pos) and ext_qty > 0:
                 ticker = self.exchange.fetch_ticker(symbol)
                 price = float(ticker.get("last") or ticker.get("close") or 0.0)
-                stop, take = self.risk.get_stop_take_prices("BUY", price)
+                side = "SELL" if signed_qty < 0 else "BUY"
+                stop, take = self.risk.get_stop_take_prices(side, price)
                 self.portfolio.open_position(
                     Position(
                         symbol=symbol,
-                        side="BUY",
+                        side=side,
                         entry_price=price,
                         qty=ext_qty,
                         entry_fee=0.0,
@@ -406,16 +434,16 @@ class TradingBot:
                         if status in {"closed", "filled", "canceled", "cancelled"}:
                             self._open_orders_snapshot.pop(oid, None)
                 elif etype == "position":
-                    symbol = str(data.get("symbol", ""))
+                    symbol = spot_symbol(str(data.get("symbol", "")))
                     if symbol and symbol in self.settings["trading"]["symbols"]:
-                        qty = float(data.get("contracts") or data.get("positionAmt") or data.get("size") or 0.0)
+                        qty = abs(float(data.get("contracts") or data.get("positionAmt") or data.get("size") or 0.0))
                         if qty <= 0 and symbol in self.portfolio.positions and not self._has_open_order_for_symbol(symbol):
                             self.portfolio.positions.pop(symbol, None)
         except Exception as exc:
             log_event(self.logger, "WARNING", "private_stream_error", "Private stream failed", error=str(exc))
 
     def _has_open_order_for_symbol(self, symbol: str) -> bool:
-        return any((o.get("symbol") == symbol) for o in self._open_orders_snapshot.values())
+        return any(spot_symbol(str(o.get("symbol", ""))) == symbol for o in self._open_orders_snapshot.values())
 
     def _is_position_consistent(self, symbol: str) -> tuple[bool, str]:
         pos = self.portfolio.positions.get(symbol)
@@ -448,16 +476,23 @@ class TradingBot:
             return self.paper_cash
         balance = self.exchange.get_balance()
         quote = self.settings["trading"]["quote_currency"]
-        return float(balance.get("total", {}).get(quote, 0.0))
+        # Vadelide açık pozisyon teminatı kilitli → yalnızca serbest bakiye kullanılabilir
+        bucket = "free" if self.leverage.enabled else "total"
+        return float(balance.get(bucket, {}).get(quote, 0.0))
 
     def _get_total_equity(self) -> float:
         if self.mode != "paper":
-            return self._get_available_balance()
+            balance = self.exchange.get_balance()
+            return float(balance.get("total", {}).get(self.settings["trading"]["quote_currency"], 0.0))
         equity = self.paper_cash
         for symbol, pos in self.portfolio.positions.items():
             mark = self._last_prices.get(symbol, pos.entry_price)
-            # Long: tutulan varlık değeri (+); Short: geri alma yükümlülüğü (-)
-            equity += pos.qty * mark if pos.side.upper() == "BUY" else -pos.qty * mark
+            if pos.margin > 0:
+                # Kaldıraçlı: kilitli teminat + gerçekleşmemiş kâr/zarar
+                equity += pos.margin + self.portfolio.unrealized_pnl(symbol, mark)
+            else:
+                # Long: tutulan varlık değeri (+); Short: geri alma yükümlülüğü (-)
+                equity += pos.qty * mark if pos.side.upper() == "BUY" else -pos.qty * mark
         return equity
 
     def _record_balance(self, total_balance: float) -> None:
@@ -605,13 +640,21 @@ class TradingBot:
         min_trades = int(self.settings.get("performance", {}).get("min_trades_for_eval", 10))
         self.risk.register_trade_outcome(pnl, win_rate=win_rate if total_trades >= min_trades else None)
 
-    def _apply_paper_close_cash(self, side: str, qty: float, price: float, fee: float = 0.0) -> None:
+    def _apply_paper_close_cash(self, trade: dict[str, Any], fee: float = 0.0) -> None:
         """Paper modda pozisyon kapanışının nakit etkisini uygular.
-        Long kapanışı (sat) → nakit girer; short kapanışı (geri al) → nakit çıkar.
+        Kaldıraçlı: serbest kalan teminat + brüt kâr/zarar nakde döner.
+        Spot: long kapanışı (sat) → nakit girer; short kapanışı (geri al) → nakit çıkar.
         """
         if self.mode != "paper":
             return
-        if side.upper() == "BUY":
+        qty = float(trade["qty"])
+        price = float(trade["exit_price"])
+        is_long = str(trade["side"]).upper() == "BUY"
+        margin = float(trade.get("margin_released", 0.0))
+        if margin > 0:
+            gross = (price - float(trade["entry_price"])) * qty
+            self.paper_cash += margin + (gross if is_long else -gross) - fee
+        elif is_long:
             self.paper_cash += qty * price - fee
         else:
             self.paper_cash -= qty * price + fee
@@ -630,12 +673,26 @@ class TradingBot:
         is_long = pos.side.upper() == "BUY"
         side = pos.side
 
+        # Likidasyon (fiyat SL'yi atlayıp likidasyon seviyesini geçtiyse): teminatın tamamı kaybedilir
+        if is_liquidated(side, current_price, pos.liquidation_price):
+            margin_lost = pos.margin
+            trade = self.portfolio.close_position(symbol, pos.liquidation_price)
+            if trade:
+                trade["pnl"] = -(margin_lost + pos.entry_fee)
+                trade["liquidated"] = True
+                self._register_trade_result(pos.strategy_name, trade["pnl"])
+                log_event(self.logger, "ERROR", "liquidation", "Position liquidated",
+                          symbol=symbol, side=side, price=current_price,
+                          liquidation_price=pos.liquidation_price, leverage=pos.leverage, pnl=trade["pnl"])
+                self.notifier.send(f"LIQUIDATED {symbol} {pos.leverage:g}x @ {current_price:.4f} PnL={trade['pnl']:.2f}")
+            return True
+
         # Stop-loss tetiklendi (long: fiyat ≤ SL, short: fiyat ≥ SL)
         sl_hit = (is_long and current_price <= pos.stop_loss) or ((not is_long) and current_price >= pos.stop_loss)
         if sl_hit:
             trade = self.portfolio.close_position(symbol, current_price)
             if trade:
-                self._apply_paper_close_cash(side, trade["qty"], current_price)
+                self._apply_paper_close_cash(trade)
                 self._register_trade_result(pos.strategy_name, trade["pnl"])
                 log_event(self.logger, "WARNING", "stop_loss_hit", "SL triggered",
                           symbol=symbol, side=side, price=current_price, sl=pos.stop_loss, pnl=trade["pnl"])
@@ -647,7 +704,7 @@ class TradingBot:
         if tp_hit:
             trade = self.portfolio.close_position(symbol, current_price)
             if trade:
-                self._apply_paper_close_cash(side, trade["qty"], current_price)
+                self._apply_paper_close_cash(trade)
                 self._register_trade_result(pos.strategy_name, trade["pnl"])
                 log_event(self.logger, "INFO", "take_profit_hit", "TP triggered",
                           symbol=symbol, side=side, price=current_price, tp=pos.take_profit, pnl=trade["pnl"])
@@ -664,7 +721,7 @@ class TradingBot:
                 trade = self.portfolio.partial_close_position(symbol, close_qty, current_price)
                 target["hit"] = True
                 if trade:
-                    self._apply_paper_close_cash(side, trade["qty"], current_price)
+                    self._apply_paper_close_cash(trade)
                     self._register_trade_result(pos.strategy_name, trade["pnl"])
                     log_event(self.logger, "INFO", "partial_tp_hit", "Partial TP triggered",
                               symbol=symbol, price=current_price, qty=trade["qty"], pnl=trade["pnl"])
@@ -819,7 +876,7 @@ class TradingBot:
         trade = self.portfolio.close_position(symbol, fill_price, fee_paid=fee_paid)
         if not trade:
             return
-        self._apply_paper_close_cash(closing_side, fill_qty, fill_price, fee_paid)
+        self._apply_paper_close_cash(trade, fee_paid)
         self._update_trade_row_on_close(symbol)
         with self.db.session_scope() as session:
             session.add(
@@ -984,6 +1041,7 @@ class TradingBot:
         order = self.execution.place_order(
             symbol, close_side, pos.qty, last_price,
             market_context=context, signal_timestamp=signal_ts, client_order_id=client_order_id,
+            reduce_only=True,
         )
         self._mark_submission(client_order_id)
         self._trace(trade_id, "order_update", status=order.get("status"), lifecycle=order.get("lifecycle"))
@@ -1049,12 +1107,19 @@ class TradingBot:
         # ATR + ADX ile dinamik SL/TP
         current_atr = regime_state.atr_pct * last_price
         stop_loss, take_profit = self.risk.get_stop_take_prices(side_u, last_price, atr=current_atr, adx=regime_state.adx)
+        lev = self.leverage.effective_leverage
+        if lev > 1.0:
+            # SL likidasyondan önce tetiklenmeli
+            stop_loss = clamp_stop_to_liquidation(
+                side_u, last_price, stop_loss, lev,
+                self.leverage.maintenance_margin_rate, self.leverage.liquidation_buffer,
+            )
 
         risk_mult = self.performance_tracker.adaptive_risk_multiplier(context["volatility"])
         corr_mult = self.risk.correlation_size_multiplier(self.portfolio, symbol)
         qty = self.risk.calculate_position_size(
             available * risk_mult * sentiment_multiplier * ob_size_mult * corr_mult * funding_multiplier,
-            last_price, stop_loss, volatility=context["volatility"],
+            last_price, stop_loss, volatility=context["volatility"], leverage=lev,
         )
         if qty <= 0:
             return
@@ -1088,8 +1153,12 @@ class TradingBot:
         fill_price = float(order.get("average") or order.get("price") or last_price)
         fill_qty = float(order.get("filled") or qty)
         fee_paid = float(order.get("fee_paid", 0.0))
+        margin = (fill_qty * fill_price) / lev if self.leverage.enabled else 0.0
+        liq_price = liquidation_price(side_u, fill_price, lev, self.leverage.maintenance_margin_rate)
         if self.mode == "paper":
-            if side_u == "BUY":
+            if margin > 0:  # kaldıraçlı: yalnızca teminat kilitlenir
+                self.paper_cash -= margin + fee_paid
+            elif side_u == "BUY":
                 self.paper_cash -= (fill_qty * fill_price) + fee_paid
             else:  # short açılışı: satış geliri nakde eklenir, fee düşülür
                 self.paper_cash += (fill_qty * fill_price) - fee_paid
@@ -1100,6 +1169,7 @@ class TradingBot:
                 symbol=symbol, side=side_u, entry_price=fill_price, qty=fill_qty, entry_fee=fee_paid,
                 stop_loss=stop_loss, take_profit=take_profit, peak_price=fill_price,
                 strategy_name=consensus_name, partial_tp_targets=tracked_tp_targets,
+                leverage=lev, margin=margin, liquidation_price=liq_price,
             )
         )
         with self.db.session_scope() as session:
@@ -1129,6 +1199,11 @@ class TradingBot:
             perf_state = self.performance_tracker.snapshot()
             new_settings = load_settings(self.settings_path)
             
+            # Kaldıraç/piyasa tipi çalışırken değiştirilemez (borsa ayarı ve açık pozisyonlar etkilenir)
+            if LeverageConfig.from_settings(new_settings) != self.leverage:
+                self.logger.warning("Leverage settings changed on disk; restart the bot to apply them")
+                new_settings["leverage"] = self.settings.get("leverage", {})
+
             # Başarıyla yüklendiyse güncelle
             self.settings = new_settings
             self.strategies = build_strategies(self.settings)
@@ -1187,6 +1262,7 @@ class TradingBot:
                 log_event(self.logger, "INFO", "heartbeat", "Loop cycle",
                           equity=round(equity, 2),
                           open_positions=self.portfolio.open_count(),
+                          margin_used=round(self.portfolio.margin_used(), 2),
                           cash=round(self.paper_cash, 2) if self.mode == "paper" else None,
                           exchange_failures=self.exchange.consecutive_failures)
                 symbols = self.settings["trading"]["symbols"]

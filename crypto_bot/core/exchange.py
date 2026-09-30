@@ -10,6 +10,8 @@ from typing import Any, AsyncGenerator, Callable, Optional
 
 import ccxt
 
+from crypto_bot.core.leverage import futures_symbol, spot_symbol
+
 
 class ExchangeError(Exception):
     pass
@@ -30,6 +32,8 @@ class ExchangeConfig:
     timeout_ms: int = 20000
     max_retries: int = 3
     retry_delay_seconds: float = 1.5
+    market_type: str = "spot"  # spot | swap (perpetual futures)
+    settle_currency: str = "USDT"
 
 
 class ExchangeRulesAdapter:
@@ -118,6 +122,7 @@ class ExchangeClient:
                 "password": config.password,
                 "enableRateLimit": config.enable_rate_limit,
                 "timeout": config.timeout_ms,
+                "options": {"defaultType": config.market_type},
             }
         )
         self._markets_loaded = False
@@ -127,6 +132,32 @@ class ExchangeClient:
         self.consecutive_failures = 0
         self.last_error: str = ""
         self.latency_ms_samples: list[float] = []
+
+    @property
+    def is_futures(self) -> bool:
+        return self.config.market_type != "spot"
+
+    def _sym(self, symbol: str) -> str:
+        """Botun iç sembolünü ('BTC/USDT') borsa sembolüne çevirir."""
+        return futures_symbol(symbol, self.config.settle_currency) if self.is_futures else symbol
+
+    def configure_leverage(self, symbols: list[str], leverage: float, margin_mode: str) -> None:
+        """Her sembol için borsada marj modunu ve kaldıracı ayarlar (yalnızca live)."""
+        if not self.is_futures:
+            return
+        for symbol in symbols:
+            ex_symbol = self._sym(symbol)
+            try:
+                self.client.set_margin_mode(margin_mode, ex_symbol)
+            except Exception as exc:
+                # Binance zaten aynı moddaysa "No need to change margin type" hatası verir
+                if "no need to change" not in str(exc).lower():
+                    raise ExchangeError(f"set_margin_mode failed for {ex_symbol}: {exc}") from exc
+            try:
+                self.client.set_leverage(int(leverage), ex_symbol)
+            except Exception as exc:
+                raise ExchangeError(f"set_leverage failed for {ex_symbol}: {exc}") from exc
+            self.logger.info("Leverage configured: %s %sx %s", ex_symbol, int(leverage), margin_mode)
 
     def load_markets(self, force_reload: bool = False) -> dict[str, Any]:
         if not self._markets_loaded or force_reload:
@@ -138,12 +169,14 @@ class ExchangeClient:
 
     def get_market(self, symbol: str) -> dict[str, Any]:
         markets = self.load_markets()
+        symbol = self._sym(symbol)
         if symbol not in markets:
             raise ExchangeError(f"Market metadata missing for symbol: {symbol}")
         return markets[symbol]
 
     def get_rules(self, symbol: str) -> dict[str, Any]:
         self.load_markets()
+        symbol = self._sym(symbol)
         if symbol not in self._rules_cache:
             self._rules_cache[symbol] = self.rules_adapter.parse(self.get_market(symbol))
         return self._rules_cache[symbol]
@@ -226,12 +259,12 @@ class ExchangeClient:
 
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 500) -> list[list[float]]:
         # Herkese açık veriler çekilebilir
-        return self._retry(self.client.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit)
+        return self._retry(self.client.fetch_ohlcv, self._sym(symbol), timeframe=timeframe, limit=limit)
 
     def get_open_orders(self, symbol: Optional[str] = None) -> list[dict[str, Any]]:
         if self.config.mode == "paper" and (not self.config.api_key or not self.config.api_secret):
             return []
-        return self._retry(self.client.fetch_open_orders, symbol)
+        return self._retry(self.client.fetch_open_orders, self._sym(symbol) if symbol else None)
 
     def fetch_positions(self, symbols: list[str]) -> dict[str, float]:
         if self.config.mode == "paper" and (not self.config.api_key or not self.config.api_secret):
@@ -239,12 +272,13 @@ class ExchangeClient:
             
         if hasattr(self.client, "fetch_positions"):
             try:
-                rows = self._retry(self.client.fetch_positions, symbols)
-                out = {}
+                rows = self._retry(self.client.fetch_positions, [self._sym(s) for s in symbols])
+                out = {s: 0.0 for s in symbols}
                 for row in rows:
-                    sym = row.get("symbol")
-                    contracts = row.get("contracts") or row.get("positionAmt") or row.get("size") or 0
-                    out[sym] = float(contracts)
+                    sym = spot_symbol(str(row.get("symbol", "")))
+                    contracts = abs(float(row.get("contracts") or row.get("positionAmt") or row.get("size") or 0))
+                    # Short pozisyonlar negatif miktar olarak döner
+                    out[sym] = -contracts if str(row.get("side", "")).lower() == "short" else contracts
                 return out
             except Exception:
                 pass
@@ -265,26 +299,26 @@ class ExchangeClient:
         return None
 
     def fetch_ticker(self, symbol: str) -> dict[str, Any]:
-        return self._retry(self.client.fetch_ticker, symbol)
+        return self._retry(self.client.fetch_ticker, self._sym(symbol))
 
     def fetch_order_book(self, symbol: str, limit: int = 50) -> dict[str, Any]:
-        return self._retry(self.client.fetch_order_book, symbol, limit)
+        return self._retry(self.client.fetch_order_book, self._sym(symbol), limit)
 
     def fetch_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        return self._retry(self.client.fetch_order, order_id, symbol)
+        return self._retry(self.client.fetch_order, order_id, self._sym(symbol))
 
     def cancel_order(self, order_id: str, symbol: str) -> dict[str, Any]:
-        return self._retry(self.client.cancel_order, order_id, symbol)
+        return self._retry(self.client.cancel_order, order_id, self._sym(symbol))
 
     def create_market_order_with_params(
         self, symbol: str, side: str, amount: float, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        return self._retry(self.client.create_order, symbol, "market", side, amount, None, params or {})
+        return self._retry(self.client.create_order, self._sym(symbol), "market", side, amount, None, params or {})
 
     def create_limit_order_with_params(
         self, symbol: str, side: str, amount: float, price: float, params: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        return self._retry(self.client.create_order, symbol, "limit", side, amount, price, params or {})
+        return self._retry(self.client.create_order, self._sym(symbol), "limit", side, amount, price, params or {})
 
     def create_limit_order(self, symbol: str, side: str, amount: float, price: float) -> dict[str, Any]:
         return self.create_limit_order_with_params(symbol, side, amount, price)
@@ -300,7 +334,7 @@ class ExchangeClient:
         merged: dict[str, Any] = {"stopLossPrice": stop_price, "triggerPrice": stop_price, "reduceOnly": True}
         if params:
             merged.update(params)
-        return self._retry(self.client.create_order, symbol, "market", side, amount, None, merged)
+        return self._retry(self.client.create_order, self._sym(symbol), "market", side, amount, None, merged)
 
     def estimate_fill_price(self, symbol: str, side: str, amount: float, limit: int = 50) -> float:
         order_book = self.fetch_order_book(symbol, limit=limit)
@@ -336,11 +370,12 @@ class ExchangeClient:
                     "secret": self.config.api_secret,
                     "password": self.config.password,
                     "enableRateLimit": self.config.enable_rate_limit,
+                    "options": {"defaultType": self.config.market_type},
                 }
             )
             try:
                 while True:
-                    candles = await ws.watch_ohlcv(symbol, timeframe)
+                    candles = await ws.watch_ohlcv(self._sym(symbol), timeframe)
                     if candles:
                         yield candles[-1]
             finally:
@@ -368,6 +403,7 @@ class ExchangeClient:
                     "secret": self.config.api_secret,
                     "password": self.config.password,
                     "enableRateLimit": self.config.enable_rate_limit,
+                    "options": {"defaultType": self.config.market_type},
                 }
             )
             try:
@@ -377,7 +413,7 @@ class ExchangeClient:
                         for order in orders or []:
                             yield {"type": "order", "data": order}
                     if hasattr(ws, "watch_positions"):
-                        positions = await ws.watch_positions(symbols)
+                        positions = await ws.watch_positions([self._sym(s) for s in symbols])
                         for position in positions or []:
                             yield {"type": "position", "data": position}
                     await asyncio.sleep(0)

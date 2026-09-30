@@ -47,6 +47,7 @@ class ReportConfig:
     risk_per_trade: float | None = 0.02
     min_trades_for_verdict: int = 10
     regime_filter: bool = False
+    leverage: float = 1.0
 
 
 def run_strategy_backtest(
@@ -74,6 +75,7 @@ def run_strategy_backtest(
         trailing_stop_pct=cfg.trailing_stop_pct,
         risk_per_trade=cfg.risk_per_trade,
         timeframe=timeframe,
+        leverage=cfg.leverage,
     )
     result = engine.run(
         data,

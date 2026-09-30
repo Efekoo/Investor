@@ -47,6 +47,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--risk", type=float, default=0.02, help="risk per trade (0 = all-in)")
     p.add_argument("--sl", type=float, default=0.02, help="stop-loss pct (0 = disabled)")
     p.add_argument("--tp", type=float, default=0.04, help="take-profit pct (0 = disabled)")
+    p.add_argument("--leverage", type=float, default=1.0, help="isolated-margin leverage (1 = spot)")
     p.add_argument("--trailing", type=float, default=0.0, help="trailing stop pct (0 = disabled)")
     p.add_argument("--settings", default=str(DEFAULT_SETTINGS))
     p.add_argument("--out", default="runtime/reports")
@@ -189,11 +190,12 @@ def main(argv: list[str] | None = None) -> None:
             trailing_stop_pct=args.trailing or None,
             risk_per_trade=args.risk or None,
             regime_filter=regime,
+            leverage=args.leverage,
         )
 
     def print_report(report) -> None:
         cols = ["strategy", "symbol", "total_return_pct", "buy_hold_return_pct",
-                "sharpe_ratio", "profit_factor", "max_drawdown", "total_trades", "verdict"]
+                "sharpe_ratio", "profit_factor", "max_drawdown", "total_trades", "liquidations", "verdict"]
         with_fmt = report[cols].copy()
         for c in ["total_return_pct", "buy_hold_return_pct", "max_drawdown"]:
             with_fmt[c] = (with_fmt[c] * 100).round(1)

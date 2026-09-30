@@ -21,6 +21,9 @@ class Position:
     strategy_name: str = "unknown"
     opened_at: datetime = field(default_factory=utcnow)
     partial_tp_targets: list = field(default_factory=list)  # [{"price": float, "close_pct": float, "hit": bool}]
+    leverage: float = 1.0
+    margin: float = 0.0             # Kaldıraçlı pozisyonda kilitlenen teminat (0 → spot muhasebesi)
+    liquidation_price: float = 0.0  # 0 → likidasyon yok (kaldıraç 1x)
 
 
 class Portfolio:
@@ -40,6 +43,8 @@ class Portfolio:
             pnl = -pnl
         pnl -= (pos.entry_fee + fee_paid)
         trade = {
+            "margin_released": pos.margin,
+            "leverage": pos.leverage,
             "symbol": pos.symbol,
             "side": pos.side,
             "qty": pos.qty,
@@ -65,8 +70,12 @@ class Portfolio:
         if pos.side.upper() == "SELL":
             pnl = -pnl
         pnl -= fee_paid
+        margin_released = pos.margin * (actual_qty / pos.qty)
+        pos.margin -= margin_released
         pos.qty -= actual_qty
         trade = {
+            "margin_released": margin_released,
+            "leverage": pos.leverage,
             "symbol": pos.symbol,
             "side": pos.side,
             "qty": actual_qty,
@@ -106,6 +115,9 @@ class Portfolio:
         pnl = (mark_price - pos.entry_price) * pos.qty
         return -pnl if pos.side.upper() == "SELL" else pnl
 
+    def margin_used(self) -> float:
+        return sum(pos.margin for pos in self.positions.values())
+
     def snapshot(self) -> dict:
         return {
             "positions": [
@@ -142,4 +154,7 @@ class Portfolio:
                 strategy_name=str(row.get("strategy_name", "unknown")),
                 opened_at=datetime.fromisoformat(row["opened_at"]),
                 partial_tp_targets=list(row.get("partial_tp_targets", [])),
+                leverage=float(row.get("leverage", 1.0)),
+                margin=float(row.get("margin", 0.0)),
+                liquidation_price=float(row.get("liquidation_price", 0.0)),
             )

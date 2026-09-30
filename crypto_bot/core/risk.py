@@ -128,9 +128,16 @@ class RiskManager:
         entry_price: float,
         stop_price: float,
         volatility: float = 0.0,
-        win_rate: float | None = None
+        win_rate: float | None = None,
+        leverage: float = 1.0,
     ) -> float:
-        """Kelly Criterion veya sabit risk kullanarak pozisyon büyüklüğü hesaplar."""
+        """Kelly Criterion veya sabit risk kullanarak pozisyon büyüklüğü hesaplar.
+
+        Kaldıraç risk miktarını (stop'ta kaybedilecek tutar) değiştirmez; yalnızca
+        teminat başına açılabilecek notional'ı büyütür. Kaldıraçlı modda
+        max_trade_size_quote teminata (margin) uygulanır.
+        """
+        leverage = max(1.0, leverage)
         effective_win_rate = win_rate if win_rate is not None else self.win_rate
         
         # Risk miktarını belirle.
@@ -160,8 +167,11 @@ class RiskManager:
         volatility_adjustment = 1.0 / (1.0 + (volatility * self.config.volatility_position_scale))
         volatility_size = raw_size * volatility_adjustment
         
-        max_affordable = balance / entry_price
-        max_by_trade_cap = self.config.max_trade_size_quote / entry_price if self.config.max_trade_size_quote > 0 else max_affordable
+        max_affordable = balance * leverage / entry_price
+        max_by_trade_cap = (
+            self.config.max_trade_size_quote * leverage / entry_price
+            if self.config.max_trade_size_quote > 0 else max_affordable
+        )
         
         final_size = max(0.0, min(volatility_size, max_affordable, max_by_trade_cap))
         return final_size

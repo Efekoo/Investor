@@ -32,6 +32,7 @@ class ExecutionConfig:
     use_post_only_entry: bool = False   # True → giriş emirleri post-only limit olarak gönderilir
     limit_entry_offset_pct: float = 0.0002  # Fiyatın ne kadar içinde limit koy (doldurulabilirlik için)
     limit_entry_timeout_seconds: float = 15.0  # Bu sürede dolmazsa market'a düş
+    futures: bool = False  # True → çıkış emirleri reduceOnly gönderilir (ters pozisyon açılmasın)
 
 
 class ExecutionEngine:
@@ -152,7 +153,7 @@ class ExecutionEngine:
                 # Stop emri kurulamadıysa pozisyonu korumasız bırakma — girişi geri al.
                 self.logger.error("Stop-loss placement failed for %s: %s. Closing entry.", symbol, exc)
                 try:
-                    self.place_order(symbol, exit_side, filled_qty, reference_price, market_context)
+                    self.place_order(symbol, exit_side, filled_qty, reference_price, market_context, reduce_only=True)
                 except Exception as close_exc:
                     self.logger.critical(
                         "Failed to unwind unprotected position for %s: %s", symbol, close_exc
@@ -208,7 +209,8 @@ class ExecutionEngine:
 
         # Real exchange logic
         v_price, v_amount = self.exchange.validate_order(symbol, price, amount)
-        return self.exchange.create_limit_order(symbol, side, v_amount, v_price)
+        params = {"reduceOnly": True} if self.config.futures else {}
+        return self.exchange.create_limit_order_with_params(symbol, side, v_amount, v_price, params=params)
 
     def place_order(
         self,
@@ -219,8 +221,11 @@ class ExecutionEngine:
         market_context: dict[str, float] | None = None,
         signal_timestamp: datetime | None = None,
         client_order_id: str | None = None,
+        reduce_only: bool = False,
     ) -> dict[str, Any]:
         side = side.lower()
+        # Vadeli piyasada kapanış emri pozisyonu yalnızca azaltabilir
+        reduce_params: dict[str, Any] = {"reduceOnly": True} if (reduce_only and self.config.futures) else {}
         order_type = self.config.order_type.lower()
         context = market_context or {}
         volatility = float(context.get("volatility", 0.0))
@@ -306,7 +311,7 @@ class ExecutionEngine:
             try:
                 # Post-only limit entry: maker fee'ye hak kazanmak için limit olarak dene,
                 # timeout içinde dolmazsa market'a düş.
-                if self.config.use_post_only_entry and order_type != "limit":
+                if self.config.use_post_only_entry and order_type != "limit" and not reduce_params:
                     limit_price = self._post_only_limit_price(side, validated_price)
                     v_limit_price, v_limit_amount = self.exchange.validate_order(symbol, limit_price, validated_amount)
                     limit_params: dict[str, Any] = {"postOnly": True}
@@ -354,6 +359,7 @@ class ExecutionEngine:
                 # Standart market veya limit
                 if order_type == "limit":
                     params = {"clientOrderId": client_order_id} if client_order_id else {}
+                    params.update(reduce_params)
                     created = self.exchange.create_limit_order_with_params(
                         symbol,
                         side,
@@ -363,6 +369,7 @@ class ExecutionEngine:
                     )
                 else:
                     params = {"clientOrderId": client_order_id} if client_order_id else {}
+                    params.update(reduce_params)
                     created = self.exchange.create_market_order_with_params(
                         symbol,
                         side,

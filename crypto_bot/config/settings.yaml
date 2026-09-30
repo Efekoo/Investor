@@ -90,6 +90,18 @@ strategy:
       atr_period: 10         # Standart Supertrend ATR periyodu
       multiplier: 3.0        # ATR çarpanı (daha büyük = daha az sinyal, daha güvenilir)
 
+leverage:
+  # Kaldıraçlı işlem: Binance USDT-M perpetual futures (BTC/USDT → BTC/USDT:USDT).
+  # enabled: false → spot davranışı (kaldıraç 1x). Değişiklik için bot yeniden başlatılmalı.
+  enabled: true
+  leverage: 3                      # Pozisyon kaldıracı (max_leverage ile sınırlanır)
+  max_leverage: 10                 # Güvenlik tavanı
+  margin_mode: isolated            # isolated: zarar yalnızca o pozisyonun teminatıyla sınırlı | cross
+  maintenance_margin_rate: 0.005   # Likidasyon fiyatı hesabı için bakım teminatı oranı
+  liquidation_buffer: 0.5          # SL, likidasyon mesafesinin en fazla %50'sinde olabilir
+  # Not: kaldıraçlı modda risk.max_trade_size_quote teminata uygulanır
+  #      (2000 teminat × 3x = en fazla 6000 notional). İşlem başı risk (risk_per_trade) değişmez.
+
 market_intelligence:
   atr_period: 14
   adx_period: 14
