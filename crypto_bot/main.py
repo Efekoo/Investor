@@ -258,6 +258,7 @@ class TradingBot:
                 limit_entry_offset_pct=float(cfg.get("limit_entry_offset_pct", 0.0002)),
                 limit_entry_timeout_seconds=float(cfg.get("limit_entry_timeout_seconds", 15.0)),
                 futures=self.leverage.enabled,
+                paper_post_only_fill_rate=float(cfg.get("paper_post_only_fill_rate", 0.5)),
             ),
         )
 
@@ -508,7 +509,10 @@ class TradingBot:
         returns = close.pct_change().dropna().tail(30)
         volatility = float(returns.std(ddof=0)) if not returns.empty else 0.0
         volume = float(df["volume"].astype(float).iloc[-1]) if not df.empty else 1.0
-        return {"volatility": volatility, "volume": volume}
+        # Kayma modeli dolar (quote) hacmiyle çalışır; coin adedi BTC gibi pahalı
+        # varlıklarda hacmi yapay olarak küçük gösterip kaymayı şişiriyordu.
+        quote_volume = volume * float(close.iloc[-1]) if not close.empty else volume
+        return {"volatility": volatility, "volume": volume, "quote_volume": quote_volume}
 
     def _process_telegram_commands(self) -> None:
         self.notifier.poll_commands(lambda cmd: "OK" if cmd == "/status" else "")
@@ -744,45 +748,54 @@ class TradingBot:
                 self.notifier.send(f"LIQUIDATED {symbol} {pos.leverage:g}x @ {current_price:.4f} PnL={trade['pnl']:.2f}")
             return True
 
-        # Stop-loss tetiklendi (long: fiyat ≤ SL, short: fiyat ≥ SL)
+        # Stop-loss tetiklendi (long: fiyat ≤ SL, short: fiyat ≥ SL).
+        # Stop market emirdir: güncel fiyattan, aleyhte kayma ve taker fee ile dolar.
         sl_hit = (is_long and current_price <= pos.stop_loss) or ((not is_long) and current_price >= pos.stop_loss)
         if sl_hit:
-            trade = self.portfolio.close_position(symbol, current_price)
+            slip = float(self.settings["risk"].get("max_slippage_pct", 0.0))
+            fill = current_price * (1 - slip) if is_long else current_price * (1 + slip)
+            fee = self._paper_exit_fee(symbol, pos.qty * fill, maker=False)
+            trade = self.portfolio.close_position(symbol, fill, fee_paid=fee)
             if trade:
-                self._apply_paper_close_cash(trade)
+                self._apply_paper_close_cash(trade, fee)
                 self._register_trade_result(pos.strategy_name, trade["pnl"])
                 log_event(self.logger, "WARNING", "stop_loss_hit", "SL triggered",
-                          symbol=symbol, side=side, price=current_price, sl=pos.stop_loss, pnl=trade["pnl"])
-                self.notifier.send(f"SL hit {symbol} @ {current_price:.4f} PnL={trade['pnl']:.2f}")
+                          symbol=symbol, side=side, price=fill, sl=pos.stop_loss, pnl=trade["pnl"])
+                self.notifier.send(f"SL hit {symbol} @ {fill:.4f} PnL={trade['pnl']:.2f}")
             return True
 
-        # Tam TP tetiklendi (long: fiyat ≥ TP, short: fiyat ≤ TP)
+        # Tam TP tetiklendi (long: fiyat ≥ TP, short: fiyat ≤ TP). TP limit emirdir:
+        # kendi fiyatından (fiyat üzerinden atlasa bile) maker fee ile dolar.
         tp_hit = (is_long and current_price >= pos.take_profit) or ((not is_long) and current_price <= pos.take_profit)
         if tp_hit:
-            trade = self.portfolio.close_position(symbol, current_price)
+            fill = pos.take_profit
+            fee = self._paper_exit_fee(symbol, pos.qty * fill, maker=True)
+            trade = self.portfolio.close_position(symbol, fill, fee_paid=fee)
             if trade:
-                self._apply_paper_close_cash(trade)
+                self._apply_paper_close_cash(trade, fee)
                 self._register_trade_result(pos.strategy_name, trade["pnl"])
                 log_event(self.logger, "INFO", "take_profit_hit", "TP triggered",
-                          symbol=symbol, side=side, price=current_price, tp=pos.take_profit, pnl=trade["pnl"])
-                self.notifier.send(f"TP hit {symbol} @ {current_price:.4f} PnL={trade['pnl']:.2f}")
+                          symbol=symbol, side=side, price=fill, tp=pos.take_profit, pnl=trade["pnl"])
+                self.notifier.send(f"TP hit {symbol} @ {fill:.4f} PnL={trade['pnl']:.2f}")
             return True
 
-        # Kademeli TP seviyeleri (long: fiyat ≥ hedef, short: fiyat ≤ hedef)
+        # Kademeli TP seviyeleri (long: fiyat ≥ hedef, short: fiyat ≤ hedef) — limit, maker fee
         for target in pos.partial_tp_targets:
-            if target.get("hit"):
+            if target.get("hit") or not self.portfolio.is_open(symbol):
                 continue
             reached = (is_long and current_price >= target["price"]) or ((not is_long) and current_price <= target["price"])
             if reached:
+                fill = float(target["price"])
                 close_qty = pos.qty * target["close_pct"]
-                trade = self.portfolio.partial_close_position(symbol, close_qty, current_price)
+                fee = self._paper_exit_fee(symbol, min(close_qty, pos.qty) * fill, maker=True)
+                trade = self.portfolio.partial_close_position(symbol, close_qty, fill, fee_paid=fee)
                 target["hit"] = True
                 if trade:
-                    self._apply_paper_close_cash(trade)
+                    self._apply_paper_close_cash(trade, fee)
                     self._register_trade_result(pos.strategy_name, trade["pnl"])
                     log_event(self.logger, "INFO", "partial_tp_hit", "Partial TP triggered",
-                              symbol=symbol, price=current_price, qty=trade["qty"], pnl=trade["pnl"])
-                    self.notifier.send(f"Partial TP {symbol} @ {current_price:.4f} qty={trade['qty']:.4f} PnL={trade['pnl']:.2f}")
+                              symbol=symbol, price=fill, qty=trade["qty"], pnl=trade["pnl"])
+                    self.notifier.send(f"Partial TP {symbol} @ {fill:.4f} qty={trade['qty']:.4f} PnL={trade['pnl']:.2f}")
 
         # Trailing stop ve TP güncelle
         if self.portfolio.is_open(symbol):
@@ -791,6 +804,13 @@ class TradingBot:
             self.portfolio.update_peak(symbol, current_price)
 
         return False
+
+    def _paper_exit_fee(self, symbol: str, notional: float, maker: bool) -> float:
+        try:
+            maker_fee, taker_fee = self.exchange.get_fee_rates(symbol)
+        except Exception:
+            maker_fee = taker_fee = float(self.settings["execution"].get("fee_pct", 0.001))
+        return max(0.0, notional * (maker_fee if maker else taker_fee))
 
     def _spread_pct(self, symbol: str) -> float:
         try:

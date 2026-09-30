@@ -148,6 +148,7 @@ risk:
 execution:
   order_type: market
   use_post_only_entry: true
+  paper_post_only_fill_rate: 0.5   # paper: post-only girişin maker dolma olasılığı (kalanı taker)
   limit_entry_offset_pct: 0.0002
   limit_entry_timeout_seconds: 15
   max_retries: 3
@@ -160,7 +161,7 @@ execution:
   order_book_depth: 50
   slippage_model: dynamic
   slippage_volatility_factor: 6.0
-  slippage_volume_factor: 300.0
+  slippage_volume_factor: 300.0   # kayma += faktör / mum dolar hacmi (eskiden coin adediyle hesaplanıyordu)
   simulate_order_delay_seconds: 0.25
   partial_fill_min_ratio: 0.6
   fee_pct: 0.001

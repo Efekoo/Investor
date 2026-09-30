@@ -33,6 +33,7 @@ class ExecutionConfig:
     limit_entry_offset_pct: float = 0.0002  # Fiyatın ne kadar içinde limit koy (doldurulabilirlik için)
     limit_entry_timeout_seconds: float = 15.0  # Bu sürede dolmazsa market'a düş
     futures: bool = False  # True → çıkış emirleri reduceOnly gönderilir (ters pozisyon açılmasın)
+    paper_post_only_fill_rate: float = 0.5  # Paper: post-only girişin maker olarak dolma olasılığı
 
 
 class ExecutionEngine:
@@ -229,7 +230,7 @@ class ExecutionEngine:
         order_type = self.config.order_type.lower()
         context = market_context or {}
         volatility = float(context.get("volatility", 0.0))
-        volume = float(context.get("volume", 1.0))
+        volume = float(context.get("quote_volume", context.get("volume", 1.0)))
         signal_ts = signal_timestamp or self._now()
 
         book_ref_price = self._estimate_reference_price(symbol, side, amount, reference_price)
@@ -257,8 +258,8 @@ class ExecutionEngine:
             # Post-only limit simülasyonu: maker fee ve hafif fiyat iyileştirmesi
             if self.config.use_post_only_entry and order_type != "limit":
                 limit_price = self._post_only_limit_price(side, validated_price)
-                # %70 ihtimalle limit dolar (kalan %30'da market fallback simüle edilir)
-                if random.random() < 0.70:
+                # Belirlenen olasılıkla limit dolar; aksi halde market fallback (taker) simüle edilir
+                if random.random() < self.config.paper_post_only_fill_rate:
                     fill_price_sim = limit_price
                     fee_rate = maker_fee  # post-only → maker
                 else:
