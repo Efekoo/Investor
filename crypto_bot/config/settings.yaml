@@ -203,6 +203,6 @@ safety:
 
 runtime:
   config_reload_seconds: 15
-  state_file: /tmp/state.json
+  state_file: runtime/state.json   # dashboard da buradan okur (docker volume ile paylaşılır)
   max_stale_data_seconds: 180
   max_clock_drift_ms: 5000

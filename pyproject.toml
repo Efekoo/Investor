@@ -16,18 +16,22 @@ dependencies = [
   "SQLAlchemy>=2.0.0",
   "requests>=2.32.0",
   "psycopg2-binary>=2.9.9",
-  "streamlit>=1.35.0",
-  "plotly>=5.22.0",
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0.0",
   "optuna>=3.6.0",
+  "httpx>=0.27.0",
 ]
 
 [tool.setuptools.packages.find]
 include = ["crypto_bot*"]
+
+[tool.setuptools.package-data]
+"crypto_bot.web" = ["static/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

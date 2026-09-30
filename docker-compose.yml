@@ -40,13 +40,14 @@ services:
     container_name: crypto_dashboard
     volumes:
       - .:/app:Z
-    command: streamlit run crypto_bot/dashboard.py --server.port 8501 --server.address 0.0.0.0
+    command: python -m crypto_bot.web
     ports:
-      - "8502:8501"
+      - "127.0.0.1:8502:8501"   # yalnızca bu makineden; ağa açacaksanız DASHBOARD_TOKEN ayarlayın
     env_file:
       - .env
     environment:
       - DATABASE_URL=postgresql://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@db:5432/${DB_NAME:-investor_db}
+      - DASHBOARD_HOST=0.0.0.0
     depends_on:
       - db
 

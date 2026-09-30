@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Investor Panel</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23111822'/><path d='M7 21l6-6 4 4 8-9' stroke='%2322c55e' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <h1>Investor</h1>
+      <span id="mode-badge" class="badge">—</span>
+      <span id="lev-badge" class="badge badge-lev" hidden>—</span>
+    </div>
+    <div class="topbar-right">
+      <span id="bot-status" class="status"><span class="dot"></span><span class="status-text">Bağlanıyor…</span></span>
+      <label class="kill" title="Açıkken bot yeni pozisyon açmaz; mevcut pozisyonlar SL/TP ile yönetilmeye devam eder">
+        <input type="checkbox" id="kill-toggle">
+        <span class="kill-track"><span class="kill-thumb"></span></span>
+        <span class="kill-label">Kill switch</span>
+      </label>
+    </div>
+  </header>
+
+  <div id="alerts" class="alerts" hidden></div>
+  <div id="notice" class="notice" hidden></div>
+
+  <main>
+    <section class="kpis" aria-label="Hesap özeti">
+      <div class="kpi"><span class="kpi-label">Toplam varlık</span><span class="kpi-value" id="k-equity">—</span><span class="kpi-sub" id="k-equity-sub">&nbsp;</span></div>
+      <div class="kpi"><span class="kpi-label">Serbest nakit</span><span class="kpi-value" id="k-cash">—</span><span class="kpi-sub">yeni pozisyon için</span></div>
+      <div class="kpi">
+        <span class="kpi-label">Kullanılan teminat</span><span class="kpi-value" id="k-margin">—</span><span class="kpi-sub" id="k-margin-sub">&nbsp;</span>
+        <div class="meter" aria-hidden="true"><span id="k-margin-bar"></span></div>
+      </div>
+      <div class="kpi"><span class="kpi-label">Gerçekleşmemiş PnL</span><span class="kpi-value" id="k-upnl">—</span><span class="kpi-sub" id="k-open">&nbsp;</span></div>
+      <div class="kpi"><span class="kpi-label">Kapanmış işlemler</span><span class="kpi-value" id="k-rpnl">—</span><span class="kpi-sub" id="k-stats">&nbsp;</span></div>
+    </section>
+
+    <section class="panel chart-panel">
+      <div class="panel-head">
+        <div class="tabs" id="symbol-tabs" role="tablist"></div>
+        <div class="chart-tools">
+          <span class="legend" id="chart-legend"></span>
+          <select id="tf-select" aria-label="Zaman dilimi">
+            <option value="1m">1m</option><option value="5m">5m</option><option value="15m">15m</option>
+            <option value="1h">1s</option><option value="4h">4s</option><option value="1d">1g</option>
+          </select>
+        </div>
+      </div>
+      <div id="price-chart" class="chart"></div>
+      <div class="chart-key">
+        <span><i class="k k-entry"></i>Giriş</span><span><i class="k k-sl"></i>Stop-loss</span>
+        <span><i class="k k-tp"></i>Take-profit</span><span><i class="k k-liq"></i>Likidasyon</span>
+        <span class="liq-note" id="liq-note"></span>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Açık pozisyonlar</h2>
+        <div class="head-actions">
+          <label class="alert-setting">Uyarı eşiği
+            <select id="alert-pct" aria-label="Likidasyon uyarı eşiği">
+              <option value="2">%2</option><option value="3">%3</option><option value="5" selected>%5</option><option value="10">%10</option>
+            </select>
+          </label>
+          <button id="close-all" class="btn btn-danger-ghost" disabled>Tümünü kapat</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="grid" id="positions">
+          <thead><tr>
+            <th>Sembol</th><th>Yön</th><th class="num">Miktar</th><th class="num">Giriş</th><th class="num">Güncel</th>
+            <th class="num">PnL</th><th class="num">ROE</th><th class="num">Teminat</th><th class="num">Likidasyon</th>
+            <th>Likidasyona mesafe</th><th class="num">SL / TP</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+        <p class="empty" id="positions-empty">Açık pozisyon yok.</p>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <section class="panel">
+        <div class="panel-head"><h2>Varlık gelişimi</h2><span class="muted" id="equity-note"></span></div>
+        <div id="equity-chart" class="chart chart-sm"></div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Son işlemler</h2><span class="muted" id="trades-note"></span></div>
+        <div class="table-wrap table-scroll">
+          <table class="grid" id="trades">
+            <thead><tr><th>Kapanış</th><th>Sembol</th><th>Yön</th><th class="num">Giriş → Çıkış</th><th class="num">PnL</th><th>Strateji</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <p class="empty" id="trades-empty">Henüz kapanmış işlem yok.</p>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

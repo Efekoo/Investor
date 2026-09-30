@@ -19,7 +19,8 @@ crypto_bot/
 │                    # loader + Optuna optimization & walk-forward analysis
 ├── database/        # SQLite persistence: orders, trades, balances, logs,
 │                    # crash-state recovery
-├── config/          # YAML settings (mode, symbols, timeframes, risk limits)
+├── web/             # Trading panel: FastAPI + TradingView Lightweight Charts
+├── config/          # YAML settings (mode, symbols, timeframes, risk limits, leverage)
 └── tests/           # 28 pytest tests
 ```
 
@@ -28,6 +29,8 @@ crypto_bot/
 - **Exchange layer** over `ccxt` with market-metadata caching and precision-aware order validation
 - **Risk module**: position sizing, stop-loss / take-profit, trailing stop, break-even moves, per-symbol limits, and a daily circuit breaker
 - **Execution engine**: paper & live modes with dynamic slippage, maker/taker fees, partial-fill simulation, and retries
+- **Leverage (optional)**: USDT-M perpetual futures with isolated/cross margin; stop-loss is pulled inside the liquidation price, exits are `reduceOnly`, paper mode simulates margin and liquidation
+- **Trading panel**: live candles with entry / SL / TP / liquidation lines, margin usage, liquidation-distance alerts, one-click position close and kill switch
 - **Telegram integration**: notifications plus `/status`, `/balance`, `/positions` commands
 
 ## Safety model
@@ -36,7 +39,7 @@ Live trading is opt-in at three levels — the default build cannot place a real
 
 1. `app.mode` in `config/settings.yaml` must be set to `live`
 2. `LIVE_TRADING_CONFIRM=YES` and `LIVE_RUNTIME_CONFIRM` must both be set in `.env`
-3. If a `runtime/KILL_SWITCH` file exists, the bot stops immediately
+3. If a `runtime/KILL_SWITCH` file exists (or the panel's kill switch is on), the bot opens no new positions; open positions keep being managed by their SL/TP
 
 Use exchange API keys with **trading-only permissions and withdrawals disabled**, and an exchange-side IP whitelist in production.
 
@@ -54,6 +57,14 @@ Or with Docker:
 ```bash
 docker compose up --build
 ```
+
+## Trading panel
+
+```bash
+python -m crypto_bot.web        # http://127.0.0.1:8501
+```
+
+The panel reads the bot's `runtime/state.json` and database, and talks back to the bot through `runtime/KILL_SWITCH` and `runtime/commands/` (processed within ~1 s). Controls work from localhost only unless `DASHBOARD_TOKEN` is set in `.env`; with Docker Compose it is served on `127.0.0.1:8502`.
 
 ## Strategy validation (do this before going live)
 
@@ -78,7 +89,7 @@ The report (CSV + HTML in `runtime/reports/`) labels each strategy x symbol pair
 pytest crypto_bot/tests
 ```
 
-28 tests covering strategies, risk rules, backtest accounting, stop-loss/sizing simulation, multi-timeframe lookahead safety, and the optimizer — run on every push via GitHub Actions.
+Tests covering strategies, risk rules, backtest accounting, stop-loss/sizing simulation, multi-timeframe lookahead safety, the optimizer, leverage/liquidation accounting, and the panel API — run on every push via GitHub Actions.
 
 ## Disclaimer
 

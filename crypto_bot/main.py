@@ -14,6 +14,7 @@ import yaml
 from dotenv import load_dotenv
 
 from crypto_bot.backtest.engine import BacktestEngine
+from crypto_bot.core.commands import pop_commands
 from crypto_bot.core.data import DataManager
 from crypto_bot.core.performance import PerformanceConfig, StrategyPerformanceTracker
 from crypto_bot.core.regime import RegimeDetector
@@ -160,6 +161,9 @@ class TradingBot:
         self.processed_signal_at: dict[str, datetime] = {}
         self.last_trade_at: dict[str, datetime] = {}
         self._last_prices: dict[str, float] = {}
+        self._last_context: dict[str, dict[str, float]] = {}
+        self._kill_switch_logged = False
+        self.commands_dir = Path(settings["runtime"].get("commands_dir", runtime_dir / "commands"))
         self.paper_cash = float(settings["app"].get("initial_paper_balance", 10_000.0))
         self._open_orders_snapshot: dict[str, dict[str, Any]] = {}
         self._submitted_order_keys: set[str] = set()
@@ -508,6 +512,59 @@ class TradingBot:
 
     def _process_telegram_commands(self) -> None:
         self.notifier.poll_commands(lambda cmd: "OK" if cmd == "/status" else "")
+
+    def _kill_switch_active(self) -> bool:
+        """Kill switch: yeni pozisyon açılmaz; açık pozisyonlar SL/TP ile yönetilmeye devam eder."""
+        safety = self.settings.get("safety", {})
+        active = bool(safety.get("global_kill_switch", False)) or Path(
+            safety.get("kill_switch_file", "runtime/KILL_SWITCH")
+        ).exists()
+        if active != self._kill_switch_logged:
+            self._kill_switch_logged = active
+            log_event(self.logger, "WARNING", "kill_switch", "Kill switch " + ("ON: new entries halted" if active else "OFF"))
+            self.notifier.send("Kill switch " + ("ON — new entries halted" if active else "OFF — trading resumed"))
+        return active
+
+    def _process_control_commands(self) -> bool:
+        """Dashboard'dan gelen komutları işler. True → durum değişti (state kaydedilmeli)."""
+        changed = False
+        for command in pop_commands(self.commands_dir):
+            action = command.get("action")
+            log_event(self.logger, "WARNING", "control_command", f"Control command: {action}", **command)
+            if action == "close_position":
+                changed |= self._manual_close(str(command.get("symbol", "")))
+            elif action == "close_all":
+                for symbol in list(self.portfolio.positions):
+                    changed |= self._manual_close(symbol)
+        return changed
+
+    def _manual_close(self, symbol: str) -> bool:
+        pos = self.portfolio.positions.get(symbol)
+        if not pos:
+            log_event(self.logger, "WARNING", "manual_close_skipped", "No open position", symbol=symbol)
+            return False
+        try:
+            ticker = self.exchange.fetch_ticker(symbol)
+            price = float(ticker.get("last") or ticker.get("close") or 0.0)
+        except Exception:
+            price = 0.0
+        price = price or self._last_prices.get(symbol, pos.entry_price)
+        self._last_prices[symbol] = price
+        close_side = "sell" if pos.side.upper() == "BUY" else "buy"
+        context = self._last_context.get(symbol) or {"volatility": 0.0, "volume": 1e9}
+        now = utcnow()
+        try:
+            self._close_open_position(symbol, close_side, price, now, context, now, self._trade_id())
+        except Exception as exc:
+            log_event(self.logger, "ERROR", "manual_close_failed", str(exc), symbol=symbol)
+            self.notifier.send(f"Manual close FAILED {symbol}: {exc}")
+            return False
+        closed = not self.portfolio.is_open(symbol)
+        log_event(self.logger, "WARNING", "manual_close", "Position closed from dashboard" if closed else "Manual close not filled",
+                  symbol=symbol, price=price)
+        if closed:
+            self.notifier.send(f"Manual close {symbol} @ {price:.4f}")
+        return closed
 
     def _can_trade_symbol(self, symbol: str) -> bool:
         cooldown = int(self.settings["trading"].get("cooldown_seconds", 0))
@@ -933,6 +990,7 @@ class TradingBot:
             return
 
         context = self._context_metrics(df)
+        self._last_context[symbol] = context
         regime_state = self.regime_detector.detect(df)
         decision, voters, vote_meta = self._consensus_decision(regime_state.regime, frames)
         if decision is None:
@@ -976,6 +1034,10 @@ class TradingBot:
                 self._close_open_position(symbol, "sell", last_price, candle_ts, context, signal_ts, trade_id)
             elif pos.side.upper() == "SELL" and decision.signal == "BUY":
                 self._close_open_position(symbol, "buy", last_price, candle_ts, context, signal_ts, trade_id)
+            return
+
+        if self._kill_switch_active():
+            self._trace(trade_id, "kill_switch_block", signal=decision.signal)
             return
 
         allow_short = bool(self.settings["trading"].get("allow_short", False))
@@ -1289,7 +1351,12 @@ class TradingBot:
                     self._safe_shutdown("Circuit breaker active")
                     return
                 self._save_state()
-                await asyncio.sleep(next_run_sleep(cadence))
+                # Bir sonraki döngüye kadar dashboard komutlarına saniyede bir bak
+                deadline = time.monotonic() + next_run_sleep(cadence)
+                while not self._stop_requested and time.monotonic() < deadline:
+                    if self._process_control_commands():
+                        self._save_state()
+                    await asyncio.sleep(1)
             except Exception as exc:
                 log_event(self.logger, "ERROR", "polling_loop_error", str(exc))
                 try:
